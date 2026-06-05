@@ -1,6 +1,6 @@
-module github.com/ai-generated/disk-block-diff
+module github.com/mrnold-agent/disk-block-diff
 
-go 1.25.0
+go 1.26
 
 require (
 	github.com/vmware/govmomi v0.52.0
