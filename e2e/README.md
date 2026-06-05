@@ -14,6 +14,8 @@ End-to-end test for the **production repair flow** with a **small configurable d
 
 The repair pod **never** runs `hash` on the NBD device. NBD is used only for block reads listed in `repair.jsonl`.
 
+E2E mounts `repair.jsonl` via ConfigMap (fine for a 1 GiB test disk). Production repair lists can exceed the Kubernetes **1 MiB ConfigMap limit** — use [examples/repair-pod.yaml](../examples/repair-pod.yaml) (`kubectl cp` + `emptyDir`) or [examples/repair-pod-batch.yaml](../examples/repair-pod-batch.yaml) for larger diffs.
+
 ## Prerequisites
 
 1. **Small test VM** on VMware with a disk of size `E2E_DISK_SIZE` (default `1GiB`).

@@ -1,27 +1,76 @@
-# Example pod for hashing an imported block-mode PVC on OpenShift.
-# Adjust namespace, PVC name, and image (build disk-block-diff into a minimal image).
+# Hash an imported block-mode PVC on OpenShift (dest manifest for diff/repair).
+#
+# Image: build once with e2e/build-image.sh (CDI importer + disk-block-diff).
+#   E2E_BASE_IMAGE=quay.io/kubevirt/cdi-importer:v1.62.0 \
+#   E2E_VDDK_IMAGE=<your-vddk-init-image> \
+#   ./e2e/build-image.sh --push quay.io/you/disk-block-diff:v1
+# Then set REPLACE_WITH_IMAGE below to that tag.
+#
+# Manifest size: 35 TiB @ 1 GiB blocks ≈ 35k lines ≈ 5 MiB JSONL — fits in emptyDir below.
+#
+# Workflow:
+#   1. kubectl apply -f examples/hash-pod.yaml   # patch image + PVC name first
+#   2. kubectl logs -f disk-block-diff-hash      # hashing may take hours/days on large disks
+#   3. When logs print "HASH COMPLETE", on your workstation (not in the pod):
+#        kubectl cp default/disk-block-diff-hash:/var/tmp/dest.jsonl ./dest.jsonl
+#      The pod sleeps HASH_HOLD_SECONDS after hash so the copy window stays open.
 apiVersion: v1
 kind: Pod
 metadata:
   name: disk-block-diff-hash
   namespace: default
+  labels:
+    app: disk-block-diff
 spec:
   restartPolicy: Never
   containers:
     - name: hasher
-      image: quay.io/centos/centos:stream9
+      image: REPLACE_WITH_IMAGE
       command:
         - /bin/bash
         - -ec
         - |
-          # Replace with a image that contains disk-block-diff, or mount binary via ConfigMap.
-          ls -l /dev/cdi-block-volume
-          /usr/local/bin/disk-block-diff info -device /dev/cdi-block-volume
-          /usr/local/bin/disk-block-diff hash \
-            -device /dev/cdi-block-volume \
-            -output /var/tmp/dest.jsonl \
-            -workers 8
-          ls -lh /var/tmp/dest.jsonl
+          set -o pipefail
+          BIN=/usr/local/bin/disk-block-diff
+          DEST=/dev/cdi-block-volume
+          OUT=/var/tmp/dest.jsonl
+          PART="${OUT}.part"
+
+          ls -l "${DEST}"
+          "${BIN}" info -device "${DEST}" -block-size "${BLOCK_SIZE}"
+
+          "${BIN}" hash \
+            -device "${DEST}" \
+            -output "${PART}" \
+            -block-size "${BLOCK_SIZE}" \
+            -workers "${HASH_WORKERS}" \
+            -progress-interval "${PROGRESS_INTERVAL}"
+
+          mv -f "${PART}" "${OUT}"
+          ls -lh "${OUT}"
+          echo ""
+          echo "=== HASH COMPLETE — run kubectl cp on your workstation (not in this pod) ==="
+          echo "kubectl cp ${POD_NAMESPACE}/${POD_NAME}:${OUT} ./dest.jsonl"
+          echo "This pod stays Running for ${HASH_HOLD_SECONDS}s so that copy can succeed."
+          echo "==========================================================================="
+          sleep "${HASH_HOLD_SECONDS}"
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: BLOCK_SIZE
+          value: 1GiB
+        - name: HASH_WORKERS
+          value: "8"
+        - name: PROGRESS_INTERVAL
+          value: 30s
+        - name: HASH_HOLD_SECONDS
+          value: "3600"
       securityContext:
         privileged: true
       volumeDevices:
@@ -36,4 +85,4 @@ spec:
         claimName: REPLACE_WITH_PVC_NAME
     - name: scratch
       emptyDir:
-        sizeLimit: 2Gi
+        sizeLimit: 128Mi

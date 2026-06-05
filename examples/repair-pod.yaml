@@ -1,7 +1,26 @@
-# Same as examples/repair-pod.yaml (kept for older links).
-# Production repair: emptyDir + kubectl cp; see repair-pod-batch.yaml for large lists.
+# Production repair pod: nbd-open + apply repair.jsonl onto a block PVC.
 #
-# Workflow: apply pod → kubectl cp repair.jsonl → touch /var/tmp/repair.jsonl.ready → logs -f
+# repair.jsonl is NOT mounted from a ConfigMap — Kubernetes ConfigMaps are limited to
+# ~1 MiB. At 1 GiB block size that is only ~5 TiB of unique mismatched chunks.
+# Use emptyDir + kubectl cp (or a scratch PVC) for production repair lists.
+#
+# Prerequisites:
+#   - Image: CDI importer + VDDK + disk-block-diff (see e2e/build-image.sh)
+#   - Secret: examples/vddk-secret.example.yaml
+#   - repair.jsonl on your workstation (from: diff -a source.jsonl -b dest.jsonl)
+#
+# Workflow:
+#   1. kubectl apply -f examples/repair-pod.yaml   # patch placeholders first
+#   2. kubectl wait --for=condition=Ready pod/disk-block-diff-repair -n default --timeout=120s
+#   3. kubectl cp repair.jsonl default/disk-block-diff-repair:/var/tmp/repair.jsonl
+#   4. kubectl exec -n default disk-block-diff-repair -- touch /var/tmp/repair.jsonl.ready
+#   5. kubectl logs -f disk-block-diff-repair
+#
+# Check size before apply (stay under ~900 KiB if you insist on ConfigMap; this pod has no such limit):
+#   wc -c repair.jsonl
+#   wc -l repair.jsonl
+#
+# For repair.jsonl > ~1 MiB or many batches, use examples/repair-pod-batch.yaml instead.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -104,6 +123,7 @@ spec:
         claimName: REPLACE_WITH_PVC_NAME
     - name: scratch
       emptyDir:
+        # repair.jsonl is ~200 bytes per mismatched 1 GiB block (~600 KiB per 3 TiB dirty).
         sizeLimit: 128Mi
     - name: run
       emptyDir: {}

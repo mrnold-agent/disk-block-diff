@@ -34,6 +34,8 @@ func diffManifests(sourcePath string, destPath string, outputPath string) error 
 	var mismatched uint64
 	var missingOnDest uint64
 	var missingOnSource uint64
+	var transferBlocks uint64
+	var transferBytes int64
 
 	allIndexes := make(map[uint64]struct{})
 	for index := range sourceByIndex {
@@ -74,6 +76,10 @@ func diffManifests(sourcePath string, destPath string, outputPath string) error 
 			if err := writeDiffRecord(out, rec); err != nil {
 				return err
 			}
+			if diffRecordTransfersBytes(rec.Reason, rec.Size) {
+				transferBlocks++
+				transferBytes += rec.Size
+			}
 		default:
 			mismatched++
 			rec := DiffRecord{
@@ -87,10 +93,15 @@ func diffManifests(sourcePath string, destPath string, outputPath string) error 
 			if err := writeDiffRecord(out, rec); err != nil {
 				return err
 			}
+			if diffRecordTransfersBytes(rec.Reason, rec.Size) {
+				transferBlocks++
+				transferBytes += rec.Size
+			}
 		}
 	}
 
 	log.Printf("diff complete: %d hash mismatches, %d missing on dest, %d missing on source", mismatched, missingOnDest, missingOnSource)
+	logRepairTransferEstimate(transferBlocks, transferBytes)
 	log.Printf("wrote %s", outputPath)
 	return nil
 }

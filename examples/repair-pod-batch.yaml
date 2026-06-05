@@ -1,11 +1,24 @@
-# Same as examples/repair-pod.yaml (kept for older links).
-# Production repair: emptyDir + kubectl cp; see repair-pod-batch.yaml for large lists.
+# Batched repair when repair.jsonl exceeds ~1 MiB (ConfigMap limit) or you want
+# smaller apply units per maintenance window.
 #
-# Workflow: apply pod → kubectl cp repair.jsonl → touch /var/tmp/repair.jsonl.ready → logs -f
+# Split on the workstation (keeps JSONL lines intact):
+#   split -l 4000 -d --additional-suffix=.jsonl repair.jsonl repair-batch-
+#   ls -lh repair-batch-*
+#
+# Workflow:
+#   1. kubectl apply -f examples/repair-pod-batch.yaml
+#   2. kubectl wait --for=condition=Ready pod/disk-block-diff-repair-batch -n default
+#   3. kubectl cp repair-batch-00.jsonl default/disk-block-diff-repair-batch:/var/tmp/
+#   kubectl cp repair-batch-01.jsonl default/disk-block-diff-repair-batch:/var/tmp/
+#      ... or: for f in repair-batch-*.jsonl; do kubectl cp "$f" ...:/var/tmp/; done
+#   4. kubectl exec -n default disk-block-diff-repair-batch -- touch /var/tmp/repair-batches.ready
+#   5. kubectl logs -f disk-block-diff-repair-batch
+#
+# One nbd-open session; apply runs each batch in sorted order.
 apiVersion: v1
 kind: Pod
 metadata:
-  name: disk-block-diff-repair
+  name: disk-block-diff-repair-batch
   namespace: default
   labels:
     app: disk-block-diff
@@ -21,11 +34,10 @@ spec:
           set -o pipefail
           BIN=disk-block-diff
           STATE=/var/run/disk-block-diff/nbd.state
-          REPAIR=/var/tmp/repair.jsonl
-          READY=/var/tmp/repair.jsonl.ready
+          READY=/var/tmp/repair-batches.ready
           WAIT_SECONDS="${REPAIR_WAIT_SECONDS:-3600}"
 
-          echo "waiting up to ${WAIT_SECONDS}s for ${REPAIR} (kubectl cp then: touch ${READY})"
+          echo "waiting up to ${WAIT_SECONDS}s for batch files + ${READY}"
           deadline=$((SECONDS + WAIT_SECONDS))
           while [[ ! -f "${READY}" ]]; do
             if (( SECONDS >= deadline )); then
@@ -34,11 +46,23 @@ spec:
             fi
             sleep 5
           done
-          if [[ ! -s "${REPAIR}" ]]; then
-            echo "repair manifest missing or empty: ${REPAIR}" >&2
+
+          mapfile -t batches < <(ls -1 /var/tmp/repair-batch-*.jsonl 2>/dev/null | sort -V)
+          if [[ ${#batches[@]} -eq 0 ]]; then
+            echo "no /var/tmp/repair-batch-*.jsonl files found" >&2
             exit 1
           fi
-          echo "repair manifest: $(wc -l < "${REPAIR}") lines, $(wc -c < "${REPAIR}") bytes"
+          echo "found ${#batches[@]} repair batch(es)"
+          total_bytes=0
+          total_lines=0
+          for batch in "${batches[@]}"; do
+            lines=$(wc -l < "${batch}")
+            bytes=$(wc -c < "${batch}")
+            total_lines=$((total_lines + lines))
+            total_bytes=$((total_bytes + bytes))
+            echo "  ${batch}: ${lines} lines, ${bytes} bytes"
+          done
+          echo "total: ${total_lines} lines, ${total_bytes} bytes"
 
           "${BIN}" nbd-open \
             -server "${VDDK_ENDPOINT}" \
@@ -50,12 +74,15 @@ spec:
             -snapshot "${VDDK_SNAPSHOT}" \
             -state-file "${STATE}"
 
-          "${BIN}" apply \
-            -nbd-state "${STATE}" \
-            -dest /dev/cdi-block-volume \
-            -blocks "${REPAIR}" \
-            -workers "${APPLY_WORKERS}" \
-            -progress-interval "${PROGRESS_INTERVAL}"
+          for batch in "${batches[@]}"; do
+            echo "=== apply ${batch} ==="
+            "${BIN}" apply \
+              -nbd-state "${STATE}" \
+              -dest /dev/cdi-block-volume \
+              -blocks "${batch}" \
+              -workers "${APPLY_WORKERS}" \
+              -progress-interval "${PROGRESS_INTERVAL}"
+          done
 
           "${BIN}" nbd-close -state-file "${STATE}"
       env:
@@ -104,7 +131,7 @@ spec:
         claimName: REPLACE_WITH_PVC_NAME
     - name: scratch
       emptyDir:
-        sizeLimit: 128Mi
+        sizeLimit: 512Mi
     - name: run
       emptyDir: {}
     - name: vddk-config

@@ -20,14 +20,31 @@ After a failed warm-migration delta you may want to verify whether the destinati
 
 ## Build
 
+**Publishable Linux binaries** (helper VM + workstation: `hash`, `diff`, `apply`):
+
 ```bash
-cd disk-block-diff
+chmod +x scripts/build-release.sh
+./scripts/build-release.sh
+# optional: link against libnbd for apply -nbd-state without nbd-client
+./scripts/build-release.sh --with-libnbd
+```
+
+Artifacts land in `dist/`:
+
+| Binary | Use |
+|--------|-----|
+| `disk-block-diff-linux-amd64` | Static; copy to VMware helper VM and admin workstation |
+| `disk-block-diff-linux-amd64-libnbd` | Linux hosts with `libnbd.so` (optional `--with-libnbd`) |
+
+Local dev build:
+
+```bash
 go build -o disk-block-diff .
 ```
 
-Static binary; no cgo. Copy the same binary to the VMware helper VM and the OpenShift importer pod.
+**OpenShift repair** (`nbd-open` + VDDK): use the container image from `e2e/build-image.sh`, not the static binary alone.
 
-`nbd-open` additionally requires **nbdkit with the VDDK plugin**, the **VDDK libraries**, and **nbd-client** plus the **nbd kernel module** (privileged pod). Use a CDI/Forklift importer-compatible image or equivalent.
+`nbd-open` requires **nbdkit with the VDDK plugin**, **VDDK libraries**, and **nbd-client** or **libnbd** (privileged pod). Use a CDI/Forklift importer-compatible image or equivalent.
 
 **VDDK is not redistributable.** Public `quay.io/kubev2v/vddk` images are empty CI shells without VMware libraries. Use the same private VDDK init image configured on your Forklift vSphere provider (or build one from VMware's VDDK tarball).
 
@@ -85,7 +102,7 @@ Use `-progress-interval 30s` to change the interval, or `-progress-interval 0` t
 
 Hash destination only: [examples/hash-pod.yaml](examples/hash-pod.yaml)
 
-Repair from vCenter without a VMware helper VM: [examples/nbd-apply-pod.yaml](examples/nbd-apply-pod.yaml)
+Repair from vCenter without a VMware helper VM: [examples/repair-pod.yaml](examples/repair-pod.yaml) (large `repair.jsonl`: [examples/repair-pod-batch.yaml](examples/repair-pod-batch.yaml))
 
 `nbd-open` starts nbdkit with the VDDK plugin, connects `nbd-client` to expose `/dev/nbd0`, and records session state. `apply -nbd-state` reads source blocks from that device.
 
@@ -100,7 +117,27 @@ kubectl cp <namespace>/<pod>:/tmp/dest.jsonl ./dest.jsonl
 ./disk-block-diff diff -a source.jsonl -b dest.jsonl -output repair.jsonl
 ```
 
-`repair.jsonl` lists every block where MD5 differs. For a 35 TiB disk with 1 GiB blocks, the manifest is at most ~35k lines per side (~few MB).
+After diff, logs include total repair transfer size and **estimated apply time** at common effective rates (100 Mb/s WAN, 1/10/25 GbE). Counts match what `apply` copies (`hash_mismatch` and `missing_on_dest`; `missing_on_source` is listed but not copied).
+
+`repair.jsonl` lists every block where MD5 differs. For a 35 TiB disk with 1 GiB blocks, the hash manifests are at most ~35k lines per side (~few MB). `repair.jsonl` is usually much smaller (only mismatched blocks).
+
+### Large `repair.jsonl` (ConfigMap limit)
+
+Do **not** put `repair.jsonl` in a Kubernetes ConfigMap for production. ConfigMap data is capped at **~1 MiB** (~5,000 differing 1 GiB blocks / ~5 TiB of uniquely dirty chunks).
+
+| Dirty data @ 1 GiB blocks | ~`repair.jsonl` size |
+|---------------------------|----------------------|
+| 3 TiB | ~600 KiB |
+| 5 TiB | ~1 MiB (ConfigMap edge) |
+| 10 TiB+ | use file copy, not ConfigMap |
+
+**Production:** copy `repair.jsonl` into the repair pod with `kubectl cp` ([examples/repair-pod.yaml](examples/repair-pod.yaml)). For lists over ~1 MiB, split on the workstation and use [examples/repair-pod-batch.yaml](examples/repair-pod-batch.yaml):
+
+```bash
+split -l 4000 -d --additional-suffix=.jsonl repair.jsonl repair-batch-
+```
+
+The E2E harness uses a ConfigMap only for small test disks.
 
 **Apply** requires a host that can read the **source** disk and write the **destination** disk. Typical patterns:
 
